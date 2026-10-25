@@ -849,6 +849,22 @@ def _resolve_sequential_tool_timeout() -> float | None:
     return resolve_timeout("tools.sequential_call", default=_resolve_concurrent_tool_timeout())
 
 
+def _can_run_terminal_inline(
+    function_name: str, function_args: dict, effective_task_id: str,
+) -> bool:
+    """True for local foreground terminal calls that need no worker-owned lifecycle."""
+    if function_name != "terminal" or function_args.get("background") or function_args.get("pty"):
+        return False
+    active_env = get_active_env(effective_task_id)
+    if active_env is not None:
+        return bool(getattr(active_env, "is_local", False))
+    try:
+        from tools.terminal_tool import _get_env_config
+        return _get_env_config().get("env_type") == "local"
+    except Exception:
+        return False
+
+
 # Tools whose call blocks on a long-running operation that supervises its own liveness: no generic
 # sequential deadline. ``delegate_task`` in a nested orchestrator blocks for the whole batch by design
 # (children carry heartbeats, the stale monitor, and ``delegation.child_timeout_seconds``); under the
@@ -928,6 +944,9 @@ def _run_sequential_tool_execution_middleware(
     else:
         authorization_gate = None
     if function_name in _NEVER_PARALLEL_TOOLS:
+        return _run_agent_tool_execution_middleware(agent, **kwargs)
+
+    if prepared is None and _can_run_terminal_inline(function_name, function_args, effective_task_id):
         return _run_agent_tool_execution_middleware(agent, **kwargs)
 
     from tools.daemon_pool import DaemonThreadPoolExecutor
