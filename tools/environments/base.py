@@ -602,6 +602,41 @@ class BaseEnvironment(ABC):
         """Kill without waiting, for a host that hard-exits next. Subclasses kill the whole tree."""
         self._kill_process(proc)
 
+    def _execute_local_foreground_communicate(
+        self, wrapped: str, *, login: bool, timeout: int | None, stdin_data: str | None,
+    ) -> dict:
+        """Run a local foreground command with ``Popen.communicate`` completion semantics."""
+        spawned = None
+        if not _enter_foreground_spawn():
+            return {"output": "[host is exiting: command not started]", "returncode": 130}
+        try:
+            spawned = self._run_bash(wrapped, login=login, timeout=timeout or self.timeout, stdin_data=stdin_data)
+        finally:
+            fenced = _leave_foreground_spawn(self, spawned)
+        try:
+            if fenced:
+                self._force_kill_process(spawned)
+            try:
+                stdout, _ = spawned.communicate(timeout=timeout or self.timeout)
+                collector = _new_output_collector(spawned, True)
+                collector.append(stdout or "")
+                result = _finalize_wait_result(collector, collector.render(), spawned.returncode)
+            except subprocess.TimeoutExpired:
+                self._kill_spawned_tree(spawned)
+                stdout, _ = spawned.communicate()
+                collector = _new_output_collector(spawned, True)
+                collector.append(stdout or "")
+                suffix = f"\n[Command timed out after {timeout or self.timeout}s]"
+                result = _finalize_wait_result(collector, collector.render(suffix=suffix).lstrip("\n"), 124)
+                result["hermes_timed_out"] = True
+        except (KeyboardInterrupt, SystemExit):
+            self._kill_spawned_tree(spawned)
+            raise
+        finally:
+            with _live_foreground_cond:
+                _live_foreground.pop(id(spawned), None)
+        return result
+
     # --- CWD extraction ---
     def _update_cwd(self, result: dict):
         """Extract CWD from command output. Override for local file-based read."""
@@ -681,6 +716,16 @@ class BaseEnvironment(ABC):
         # Login shell if the snapshot failed (so the user's profile still
         # loads), unless login itself is broken — then non-login is the only path.
         login = not self._snapshot_ready and not self._prefer_nonlogin
+
+        if self.is_local and bounded_capture and yield_handler is None:
+            result = self._execute_local_foreground_communicate(
+                wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin,
+            )
+            self._update_cwd(result)
+            if getattr(self, "_recreated_notice_pending", False):
+                self._recreated_notice_pending = False
+                result["environment_recreated"] = True
+            return result
 
         parent_tid = threading.current_thread().ident
         # The activity callback is thread-local and the wait runs on the
